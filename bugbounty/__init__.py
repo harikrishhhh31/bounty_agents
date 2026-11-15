@@ -11,7 +11,9 @@ from .config import ScopeConfig, SecurityAppConfig
 from .engagement import AuthIdentity, Engagement
 from .findings import Finding, FindingStore
 from .http_client import HttpClient, HttpResponse
+from .investigation import InvestigationMemory
 from .safety import SafetyPolicy
+from .workspace import ExecutionHistory
 
 __all__ = [
     "AgentRegistry",
@@ -20,10 +22,12 @@ __all__ = [
     "AssessmentResult",
     "AuthIdentity",
     "Engagement",
+    "ExecutionHistory",
     "Finding",
     "FindingStore",
     "HttpClient",
     "HttpResponse",
+    "InvestigationMemory",
     "ScopeConfig",
     "SecurityAppConfig",
     "SafetyPolicy",

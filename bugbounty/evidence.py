@@ -29,6 +29,10 @@ class Evidence:
 class EvidenceStore:
     workspace: str = "."
     artifacts: list[Evidence] = field(default_factory=list)
+    _index: dict[str, Evidence] = field(default_factory=dict, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._index = {item.evidence_id: item for item in self.artifacts}
 
     def add(self, *, check_id: str, endpoint: str, request_metadata: dict[str, Any], response_metadata: dict[str, Any], observation: str, expected_behavior: str, actual_behavior: str, verification_status: str) -> Evidence:
         evidence = Evidence(
@@ -44,7 +48,37 @@ class EvidenceStore:
             verification_status=verification_status,
         )
         self.artifacts.append(evidence)
+        self._index[evidence.evidence_id] = evidence
         return evidence
+
+    def get(self, evidence_id: str) -> Evidence | None:
+        if not self._index and self.artifacts:
+            self._index = {item.evidence_id: item for item in self.artifacts}
+        return self._index.get(evidence_id)
+
+    @classmethod
+    def load(cls, workspace: str | Path) -> "EvidenceStore":
+        path = Path(workspace) / "evidence.json"
+        store = cls(workspace=str(workspace))
+        if not path.exists():
+            return store
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return store
+        if not isinstance(payload, list):
+            return store
+        artifacts: list[Evidence] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            try:
+                artifacts.append(Evidence(**item))
+            except TypeError:
+                continue
+        store.artifacts = artifacts
+        store._index = {item.evidence_id: item for item in artifacts}
+        return store
 
     def write(self, path: str | Path | None = None) -> Path:
         requested = Path(path) if path is not None else None

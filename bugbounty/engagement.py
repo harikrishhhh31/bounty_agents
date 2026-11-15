@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Mapping
+from typing import Any, Mapping
 from uuid import uuid4
 
 from .config import ScopeConfig
@@ -116,6 +116,29 @@ class Engagement:
     resource_probes: list[ResourceProbe] = field(default_factory=list)
     business_flows: list[BusinessFlow] = field(default_factory=list)
     ssrf_cases: list[SsrfCase] = field(default_factory=list)
+    nuclei_enabled: bool = False
+    nuclei_options: dict[str, Any] = field(default_factory=dict)
+    external_tools: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def enabled_external_tools(self) -> dict[str, dict[str, Any]]:
+        """Return the enabled external tools mapped to their per-tool options.
+
+        Backwards compatibility: ``nuclei_enabled``/``nuclei_options`` still enable
+        the Nuclei adapter. ``external_tools`` is the general form, e.g.::
+
+            {"zap": {"enabled": True, "options": {"timeout_seconds": 60}}}
+        """
+
+        enabled: dict[str, dict[str, Any]] = {}
+        for name, config in (self.external_tools or {}).items():
+            if not isinstance(config, dict):
+                continue
+            if config.get("enabled"):
+                options = config.get("options") or {}
+                enabled[str(name).strip().lower()] = dict(options) if isinstance(options, dict) else {}
+        if self.nuclei_enabled and "nuclei" not in enabled:
+            enabled["nuclei"] = dict(self.nuclei_options or {})
+        return enabled
 
     def scope(self) -> ScopeConfig:
         return ScopeConfig(

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hmac
 import json
 import html
+import os
 import tempfile
 from dataclasses import asdict, dataclass
 from email.parser import BytesParser
@@ -9,14 +11,31 @@ from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 from .assessment import AssessmentEngine, AssessmentResult
+from .attack_surface_graph import AttackSurfaceGraph
 from .engagement import Engagement
 from .importers import BurpExchange, BurpScopeConfiguration, build_inventory, inventory_to_endpoints, match_burp_scope, match_burp_scope_host, match_scope, parse_burp_json, parse_burp_json_document, parse_burp_xml, parse_hackerone_scope
 from .policy import ProgramPolicy, parse_program_markdown
 from .reports import report_data, write_reports
 from .checks import default_checks
+
+
+def _configured_dashboard_token() -> str | None:
+    token = os.getenv("BUGBOUNTY_DASHBOARD_TOKEN")
+    if token and token.strip():
+        return token.strip()
+    token_file = os.getenv("BUGBOUNTY_DASHBOARD_TOKEN_FILE")
+    if token_file:
+        try:
+            value = Path(token_file).read_text(encoding="utf-8").strip()
+            return value or None
+        except OSError:
+            return None
+    return None
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,7 +129,22 @@ class DashboardState:
         methods = sorted({item.method for item in in_scope})
         if not methods:
             methods = ["GET"]
-        engagement = Engagement(target_url=target_url, allowed_hosts=allowed_hosts, allowed_methods=methods, dry_run=bool(payload.get("dry_run", True)), maximum_requests=int(payload.get("maximum_requests", 50)), timeout=float(payload.get("timeout", 5)), workspace=str(payload.get("workspace", self.workspace)))
+        external_tools = payload.get("external_tools")
+        external_tools = dict(external_tools) if isinstance(external_tools, dict) else {}
+        nuclei_options = payload.get("nuclei_options")
+        nuclei_options = dict(nuclei_options) if isinstance(nuclei_options, dict) else {}
+        engagement = Engagement(
+            target_url=target_url,
+            allowed_hosts=allowed_hosts,
+            allowed_methods=methods,
+            dry_run=bool(payload.get("dry_run", True)),
+            maximum_requests=int(payload.get("maximum_requests", 50)),
+            timeout=float(payload.get("timeout", 5)),
+            workspace=str(payload.get("workspace", self.workspace)),
+            external_tools=external_tools,
+            nuclei_enabled=bool(payload.get("nuclei_enabled", False)),
+            nuclei_options=nuclei_options,
+        )
         engagement.validate()
         checks = default_checks()
         policy_warnings = list(self.program.manual_attention) if self.program else ["Program Markdown was not imported; manual policy confirmation required"]
@@ -168,6 +202,57 @@ class DashboardState:
             "effective_scope": sum(1 for asset in self.scope.assets if asset.eligible and asset.supported and self._asset_host_in_burp_scope(asset)) if self.scope else 0,
         }
 
+    def overview(self) -> dict[str, Any]:
+        """Aggregate dashboard state into a single status payload."""
+
+        result = self.result
+        findings = [item.as_dict() for item in result.findings.findings] if result else []
+        severity: dict[str, int] = {}
+        status: dict[str, int] = {}
+        for finding in findings:
+            key = str(finding.get("severity") or "info")
+            severity[key] = severity.get(key, 0) + 1
+            key = str(finding.get("status") or "unknown")
+            status[key] = status.get(key, 0) + 1
+        checks = list(result.check_results) if result else []
+        external_checks = [
+            {"check_id": item.check_id, "status": item.status, "reason": item.reason}
+            for item in checks
+            if item.category == "EXTERNAL"
+        ]
+        return {
+            "engagement": (
+                {
+                    "engagement_id": result.engagement.engagement_id,
+                    "target_url": result.engagement.target_url,
+                    "dry_run": result.engagement.dry_run,
+                }
+                if result
+                else None
+            ),
+            "intersection": self.intersection_summary(),
+            "validation_complete": self.validation_complete,
+            "counts": {
+                "endpoints": len(self.inventory),
+                "findings": len(findings),
+                "verified_findings": sum(1 for item in findings if item.get("status") == "verified"),
+                "unverified_findings": sum(1 for item in findings if item.get("status") == "not_verified"),
+                "evidence": len(result.evidence.artifacts) if result else 0,
+                "checks": len(checks),
+                "checks_executed": sum(1 for item in checks if item.executed),
+                "checks_not_run": sum(1 for item in checks if item.status == "NOT_RUN"),
+                "checks_error": sum(1 for item in checks if item.status == "ERROR"),
+            },
+            "severity": severity,
+            "finding_status": status,
+            "classification": dict(result.classification) if result else {},
+            "external_tools": {
+                "enabled": sorted(result.engagement.enabled_external_tools()) if result else [],
+                "checks": external_checks,
+            },
+            "reports": [{"kind": kind, "filename": path.name} for kind, path in self.report_paths.items()],
+        }
+
     def _add_report_context(self, warnings: list[str]) -> None:
         if not self.program:
             return
@@ -193,40 +278,92 @@ class DashboardState:
 class DashboardHandler(BaseHTTPRequestHandler):
     state = DashboardState()
 
+    def _is_authorized(self) -> bool:
+        expected = _configured_dashboard_token()
+        if not expected:
+            return True
+        provided = self.headers.get("X-Dashboard-Token", "").strip()
+        auth = self.headers.get("Authorization", "").strip()
+        if auth.lower().startswith("bearer "):
+            provided = auth[7:].strip() or provided
+        return bool(provided) and hmac.compare_digest(provided, expected)
+
+    def _require_auth(self) -> bool:
+        if self._is_authorized():
+            return True
+        self._json({"error": "unauthorized", "message": "valid dashboard authentication token required"}, status=401)
+        return False
+
     def do_OPTIONS(self) -> None:
         self.send_response(204)
         self._cors_headers()
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Dashboard-Token")
         self.end_headers()
 
     def do_GET(self) -> None:
         try:
-            if self.path == "/scope":
+            if not self._require_auth():
+                return
+            parsed = urlsplit(self.path)
+            path = parsed.path
+            if path == "/scope":
                 self._json({"assets": [asdict(item) for item in self.state.scope.assets]} if self.state.scope else {"assets": []})
-            elif self.path == "/program":
+            elif path == "/program":
                 self._json(self.state.program.as_dict() if self.state.program else {"program": None})
-            elif self.path == "/burp/traffic":
+            elif path == "/burp/traffic":
                 self._json({"traffic": [_exchange_view(item, self.state.scope) for item in self.state.exchanges]})
-            elif self.path == "/burp":
+            elif path == "/burp":
                 self._json({"format": self.state.exchanges[0].request.source.rsplit(".", 1)[-1] if self.state.exchanges else None, "requests": len(self.state.exchanges), "intersection": self.state.intersection_summary()})
-            elif self.path == "/endpoints":
+            elif path == "/endpoints":
                 self._json({"endpoints": [item.as_dict() for item in self.state.inventory]})
-            elif self.path == "/findings":
+            elif path == "/overview":
+                self._json(self.state.overview())
+            elif path == "/findings":
                 self._json({"findings": [item.as_dict() for item in self.state.result.findings.findings]} if self.state.result else {"findings": []})
-            elif self.path == "/evidence":
+            elif path == "/evidence":
                 self._json({"evidence": [item.as_dict() for item in self.state.result.evidence.artifacts]} if self.state.result else {"evidence": []})
-            elif self.path.startswith("/evidence/"):
-                evidence_id = self.path.rsplit("/", 1)[-1]
+            elif path.startswith("/evidence/"):
+                evidence_id = path.rsplit("/", 1)[-1]
                 item = next((item.as_dict() for item in self.state.result.evidence.artifacts if item.evidence_id == evidence_id), None) if self.state.result else None
                 self._json(item or {"error": "evidence not found"}, status=200 if item else 404)
-            elif self.path.startswith("/reports/"):
-                kind = self.path.rsplit("/", 1)[-1]
-                path = self.state.report_paths.get(kind)
-                if not path:
+            elif path == "/graph":
+                workspace = self.state.result.engagement.workspace if self.state.result else str(self.state.workspace)
+                graph = AttackSurfaceGraph.load(workspace)
+                self._json({"workspace": str(workspace), "graph": graph.to_dashboard_graph(), "summary": {"nodes": len(graph.nodes), "relationships": len(graph.relationships)}})
+            elif path == "/graph/export":
+                workspace = self.state.result.engagement.workspace if self.state.result else str(self.state.workspace)
+                graph = AttackSurfaceGraph.load(workspace)
+                self._json(graph.to_dict())
+            elif path == "/tools":
+                try:
+                    from .tool_adapters import get_adapter, known_adapter_names
+
+                    enabled = set(self.state.result.engagement.enabled_external_tools()) if self.state.result else set()
+                    tools = {}
+                    for name in known_adapter_names():
+                        version = None
+                        is_available = False
+                        try:
+                            adapter = get_adapter(name)
+                            is_available = bool(adapter.availability())
+                            if is_available:
+                                version = adapter.version()
+                        except Exception:
+                            version = None
+                        tools[name] = {"name": name, "available": is_available, "version": version, "enabled": name in enabled}
+                    self._json({"tools": tools, "known": list(known_adapter_names())})
+                except Exception as error:
+                    self._json({"tools": {}, "error": type(error).__name__, "message": str(error)})
+            elif path == "/reports":
+                self._json({"reports": [{"kind": kind, "filename": path.name} for kind, path in self.state.report_paths.items()]})
+            elif path.startswith("/reports/"):
+                kind = path.rsplit("/", 1)[-1]
+                file_path = self.state.report_paths.get(kind)
+                if not file_path:
                     self._json({"error": "report not found"}, status=404)
                 else:
-                    self._text(path.read_text(encoding="utf-8"), content_type={"json": "application/json", "html": "text/html"}.get(kind, "text/markdown"))
+                    self._text(file_path.read_text(encoding="utf-8"), content_type={"json": "application/json", "html": "text/html"}.get(kind, "text/markdown"))
             else:
                 self._json({"error": "not found"}, status=404)
         except Exception as error:
@@ -234,18 +371,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
-            if self.path == "/engagement/validate":
+            if not self._require_auth():
+                return
+            parsed = urlsplit(self.path)
+            path = parsed.path
+            if path == "/engagement/validate":
                 fields = self._read_multipart()
                 self._json(self.state.validate_engagement(fields["program_rules"], fields["scope_file"][0], fields["scope_file"][1], fields["burp_file"][0], fields["burp_file"][1]))
                 return
             payload = self._read_json()
-            if self.path == "/program/import":
+            if path == "/program/import":
                 self._json(self.state.import_program(str(payload.get("filename", "program.md")), str(payload.get("content", ""))))
-            elif self.path == "/scope/import":
+            elif path == "/scope/import":
                 self._json(self.state.import_scope(str(payload.get("filename", "scope.csv")), str(payload.get("content", ""))))
-            elif self.path == "/burp/import":
+            elif path == "/burp/import":
                 self._json(self.state.import_burp(str(payload.get("filename", "burp.xml")), str(payload.get("content", ""))))
-            elif self.path == "/assessment/run":
+            elif path == "/assessment/run":
                 self._json(self.state.run_assessment(payload, require_validation=True))
             else:
                 self._json({"error": "not found"}, status=404)
@@ -306,7 +447,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if origin in {"http://localhost:5173", "http://127.0.0.1:5173"}:
             self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Dashboard-Token")
 
     def log_message(self, format: str, *args: object) -> None:
         return

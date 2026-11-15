@@ -50,6 +50,20 @@ def load_assessment_config(path: str | Path) -> LoadedAssessmentConfig:
         raise ConfigurationError("allowed_hosts must be a non-empty list of host names")
 
     identities = [_identity(item) for item in _list(raw, "identities")]
+    nuclei = raw.get("nuclei", {})
+    if nuclei is None:
+        nuclei = {}
+    if not isinstance(nuclei, dict):
+        raise ConfigurationError("nuclei must be an object")
+    nuclei_enabled = bool(nuclei.get("enabled", raw.get("nuclei_enabled", False)))
+    nuclei_options = nuclei.get("options", {})
+    if nuclei_options is None:
+        nuclei_options = {}
+    if not isinstance(nuclei_options, dict):
+        raise ConfigurationError("nuclei.options must be an object")
+
+    external_tools = _external_tools(raw)
+
     engagement = Engagement(
         target_url=target_url,
         allowed_hosts=[item.strip() for item in allowed_hosts],
@@ -70,6 +84,9 @@ def load_assessment_config(path: str | Path) -> LoadedAssessmentConfig:
         resource_probes=[ResourceProbe(**_case(item, ResourceProbe)) for item in _list(raw, "resource_probes")],
         business_flows=[_flow(item) for item in _list(raw, "business_flows")],
         ssrf_cases=[SsrfCase(**_case(item, SsrfCase)) for item in _list(raw, "ssrf_cases")],
+        nuclei_enabled=nuclei_enabled,
+        nuclei_options=nuclei_options,
+        external_tools=external_tools,
     )
     try:
         engagement.validate()
@@ -83,6 +100,52 @@ def load_assessment_config(path: str | Path) -> LoadedAssessmentConfig:
     if "endpoint_list" in discovery and not isinstance(discovery["endpoint_list"], list):
         raise ConfigurationError("discovery.endpoint_list must be a list")
     return LoadedAssessmentConfig(engagement, discovery)
+
+
+def _external_tools(raw: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Normalize the ``external_tools`` block into the Engagement mapping.
+
+    Accepts either a mapping of ``name -> {enabled, options}`` or a shorthand
+    list of tool names (all enabled with default options), e.g.::
+
+        external_tools:
+          zap: {enabled: true, options: {timeout_seconds: 60}}
+          ffuf: {enabled: false}
+
+        # or
+        external_tools: [nuclei, zap]
+    """
+
+    value = raw.get("external_tools")
+    if value is None:
+        return {}
+    if isinstance(value, list):
+        tools: dict[str, dict[str, Any]] = {}
+        for item in value:
+            if not isinstance(item, str) or not item.strip():
+                raise ConfigurationError("external_tools list must contain non-empty tool names")
+            tools[item.strip().lower()] = {"enabled": True, "options": {}}
+        return tools
+    if not isinstance(value, dict):
+        raise ConfigurationError("external_tools must be an object or a list of tool names")
+    tools = {}
+    for name, config in value.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigurationError("external_tools keys must be non-empty tool names")
+        if config is None:
+            config = {}
+        if not isinstance(config, dict):
+            raise ConfigurationError(f"external_tools.{name} must be an object")
+        unknown = set(config) - {"enabled", "options"}
+        if unknown:
+            raise ConfigurationError(f"unsupported fields for external_tools.{name}: {', '.join(sorted(unknown))}")
+        options = config.get("options", {})
+        if options is None:
+            options = {}
+        if not isinstance(options, dict):
+            raise ConfigurationError(f"external_tools.{name}.options must be an object")
+        tools[name.strip().lower()] = {"enabled": bool(config.get("enabled", False)), "options": options}
+    return tools
 
 
 def _list(raw: dict[str, Any], key: str) -> list[dict[str, Any]]:

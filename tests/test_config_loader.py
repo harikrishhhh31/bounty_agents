@@ -78,3 +78,65 @@ def test_config_validation_does_not_print_secret(tmp_path: Path, capsys):
 
     assert main(["assess", "--config", str(config)]) == 2
     assert "hidden-token" not in capsys.readouterr().out
+
+
+def test_config_loads_external_tools_mapping(tmp_path: Path):
+    config = tmp_path / "engagement.yaml"
+    config.write_text(
+        """
+target_url: http://127.0.0.1:1234
+allowed_hosts: [127.0.0.1]
+allowed_schemes: [http]
+external_tools:
+  zap:
+    enabled: true
+    options:
+      timeout_seconds: 60
+  ffuf:
+    enabled: false
+""",
+        encoding="utf-8",
+    )
+
+    loaded = load_assessment_config(config)
+
+    enabled = loaded.engagement.enabled_external_tools()
+    assert set(enabled) == {"zap"}
+    assert enabled["zap"]["timeout_seconds"] == 60
+
+
+def test_config_loads_external_tools_list_shorthand(tmp_path: Path):
+    config = tmp_path / "engagement.yaml"
+    config.write_text(
+        """
+target_url: http://127.0.0.1:1234
+allowed_hosts: [127.0.0.1]
+allowed_schemes: [http]
+external_tools: [Nuclei, zap]
+""",
+        encoding="utf-8",
+    )
+
+    loaded = load_assessment_config(config)
+
+    enabled = loaded.engagement.enabled_external_tools()
+    assert set(enabled) == {"nuclei", "zap"}
+
+
+def test_config_rejects_unknown_external_tool_field(tmp_path: Path):
+    config = tmp_path / "bad.yaml"
+    config.write_text(
+        """
+target_url: http://127.0.0.1:1234
+allowed_hosts: [127.0.0.1]
+allowed_schemes: [http]
+external_tools:
+  zap:
+    enabled: true
+    bogus: 1
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigurationError, match="unsupported fields"):
+        load_assessment_config(config)

@@ -167,3 +167,13 @@
 - All network activity performed by checks goes through `HttpClient`, which enforces scheme/scope/method allowlists, request budgets, rate limiting, timeouts, redirect policy, and dry-run behavior.
 - Configuration-driven checks (`Object/Function/Property/Resource/Flow/SSRF` cases) only activate when explicit cases/probes are provided.
 - Dashboard can disable API4 based on parsed program policy (`dos_prohibited`).
+
+## 6. External tool adapters (optional)
+
+Seven adapters are wired into the central engine via `bugbounty/tool_adapters.py` and `bugbounty/assessment.py`: Nuclei, ZAP, Burp, Schemathesis, RESTler, ffuf, Kiterunner. Each subclasses `BaseSubprocessAdapter` and emits `ToolFindingRecord` with `category="external-<name>"`, `status="candidate"`, redacted evidence, and provenance (tool, version, target, redacted command).
+
+Engine flow: `_run_external_tools` -> `_run_single_external_tool` -> adapter availability check (missing binary -> `external:<name>` `NOT_RUN`), dry-run -> `NOT_RUN`, unknown tool -> `ERROR`. External findings are created with status `not_verified` and classified by `bugbounty.normalization.classify_findings`. The central engine is authoritative; external output is observation, not proof. All subprocess calls use argv (`shell=False`) with timeouts, output bounds, and config allowlists.
+
+## 7. Classification vocabulary
+
+`bugbounty.normalization` defines `Observation`/`ClassificationSummary`. `classify_findings` returns counts of `confirmed`, `probable`, `unverified`, `rejected`. These map to legacy `Finding.status`: confirmed->verified, probable->candidate, unverified->not_verified, rejected->rejected. `AssessmentResult.classification` and `report_data` expose the summary; reports print a `Classification:` line.

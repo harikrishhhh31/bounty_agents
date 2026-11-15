@@ -41,6 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     assess_parser.add_argument("--dry-run", action="store_true")
     assess_parser.add_argument("--max-requests", type=int, default=50)
     assess_parser.add_argument("--timeout", type=float, default=5.0)
+    assess_parser.add_argument("--nuclei", action="store_true", help="enable optional Nuclei adapter (requires nuclei binary; respects scope and dry-run)")
 
     report_parser = subparsers.add_parser("report", help="show or regenerate report paths")
     report_parser.add_argument("--workspace", default="./workspace")
@@ -48,6 +49,15 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard_parser = subparsers.add_parser("dashboard", help="start the local passive-import dashboard API")
     dashboard_parser.add_argument("--host", default="127.0.0.1")
     dashboard_parser.add_argument("--port", type=int, default=8765)
+
+    graph_parser = subparsers.add_parser("graph", help="inspect or export the attack surface graph")
+    graph_parser.add_argument("--workspace", default="./workspace")
+    graph_parser.add_argument("--summary", action="store_true", help="print graph node/relationship counts")
+    graph_parser.add_argument("--export", help="export graph JSON to a file path")
+    graph_parser.add_argument("--endpoint", help="show graph details for an endpoint path or URL fragment")
+
+    tools_parser = subparsers.add_parser("tools", help="show optional external tool adapter status")
+    tools_parser.add_argument("--workspace", default=".")
 
     return parser
 
@@ -61,6 +71,7 @@ def _engagement(args: argparse.Namespace) -> Engagement:
         timeout=getattr(args, "timeout", 5.0),
         dry_run=getattr(args, "dry_run", False),
         workspace=args.workspace,
+        nuclei_enabled=bool(getattr(args, "nuclei", False)),
     )
 
 
@@ -114,6 +125,69 @@ def main(argv: list[str] | None = None) -> int:
         endpoints = ApiDiscovery(engagement, HttpClient(engagement)).discover()
         print(json.dumps([item.as_dict() for item in endpoints], indent=2))
         return 0
+    if args.command == "tools":
+        try:
+            from .tool_adapters import available_adapters, get_adapter
+            availability = available_adapters()
+            tools = {}
+            for name, is_available in availability.items():
+                version = None
+                try:
+                    adapter = get_adapter(name)
+                    if is_available and hasattr(adapter, "version"):
+                        version = adapter.version()
+                except Exception:
+                    version = None
+                tools[name] = {"name": name, "available": bool(is_available), "version": version}
+            print(json.dumps({"tools": tools}, indent=2))
+            return 0
+        except Exception as error:
+            print(f"Tool status error: {error}")
+            return 2
+    if args.command == "graph":
+        try:
+            from .attack_surface_graph import AttackSurfaceGraph
+            workspace = Path(args.workspace)
+            graph = AttackSurfaceGraph.load(workspace)
+            if args.export:
+                dest = Path(args.export)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                graph.export_json(dest)
+                print(f"Exported graph: {dest}")
+                return 0
+            if args.endpoint:
+                matches = []
+                needle = args.endpoint
+                for item in graph.query_endpoints():
+                    ep = item["endpoint"]
+                    ep_path = str(ep.key.get("path") or ep.attributes.get("path") or "")
+                    ep_url = str(ep.attributes.get("url") or "")
+                    if needle in ep_path or needle in ep_url or needle == ep.label:
+                        findings = [{"id": n.id, "label": n.label, "type": n.type, "attributes": n.attributes} for n in graph.findings_for_endpoint(ep.id)]
+                        evidence_links = []
+                        for rel in graph.finding_evidence_relationships():
+                            if rel["finding"].id in {f["id"] for f in findings}:
+                                evidence_links.append({"finding": rel["finding"].id, "evidence": rel["evidence"].id, "evidence_label": rel["evidence"].label})
+                        matches.append({"endpoint": ep.as_dict(), "findings": findings, "finding_evidence": evidence_links})
+                print(json.dumps({"workspace": str(workspace), "query": needle, "matches": matches}, indent=2))
+                return 0
+            summary = {
+                "workspace": str(workspace),
+                "exists": (workspace / "attack_surface_graph.json").exists() if workspace.suffix.lower() != ".json" else workspace.exists(),
+                "nodes": len(graph.nodes),
+                "relationships": len(graph.relationships),
+                "node_types": {},
+                "relationship_types": {},
+            }
+            for node in graph.nodes.values():
+                summary["node_types"][node.type] = summary["node_types"].get(node.type, 0) + 1
+            for rel in graph.relationships.values():
+                summary["relationship_types"][rel.type] = summary["relationship_types"].get(rel.type, 0) + 1
+            print(json.dumps(summary, indent=2))
+            return 0
+        except Exception as error:
+            print(f"Graph error: {error}")
+            return 2
     build_parser().print_help()
     return 0
 

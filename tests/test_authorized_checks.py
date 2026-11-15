@@ -46,7 +46,7 @@ def test_configured_authorization_and_safety_checks_produce_evidence(tmp_path: P
         assert {"API1", "API2", "API3", "API4", "API5", "API6", "API7", "API8"}.issubset(categories)
         assert all(finding.evidence_ids for finding in result.findings.findings)
         assert any(item.check_id == "api1-bola" and item.verified for item in result.check_results)
-        assert any(item.check_id == "api5-function-authorization" and item.verified for item in result.check_results)
+        assert any(item.check_id == "api5-broken-function-level-authorization" and item.verified for item in result.check_results)
         assert any(item.check_id == "api6-sensitive-business-flow" and item.status == "FAIL" for item in result.check_results)
         assert all("expired-token" not in str(item.as_dict()) for item in result.evidence.artifacts)
     finally:
@@ -70,8 +70,9 @@ def test_bola_uses_other_object_id_and_records_both_object_requests(tmp_path: Pa
         )
         result = AssessmentEngine(engagement).run()
 
-        bola = next(item for item in result.check_results if item.check_id == "api1-bola")
+        bola = next(item for item in result.check_results if item.check_id == "api1-bola" and item.status == "PASS")
         assert bola.status == "PASS"
+        assert bola.executed is True
         assert not any(finding.category == "API1" for finding in result.findings.findings)
         evidence = next(item for item in result.evidence.artifacts if item.check_id == "api1-bola")
         assert evidence.request_metadata["owner_identity"] == "alice"

@@ -14,6 +14,19 @@ from .http_client import HttpClient, HttpResponse
 
 @dataclass(frozen=True, slots=True)
 class CheckResult:
+    """Result from executing a security check.
+
+    Status values:
+    - PASS: Executed successfully; no vulnerability detected.
+    - VULNERABLE: Executed successfully; vulnerability evidence found.
+    - FAIL: Executed successfully; unexpected failure (may indicate auth/access issues).
+    - NOT_RUN: Preconditions not met; test did not execute.
+    - NOT_APPLICABLE: Check does not apply to this endpoint category.
+    - ERROR: Execution failed due to exception.
+
+    For identity-dependent checks (API1-5), the identities field tracks which
+    authentication contexts were used for this check execution.
+    """
     check_id: str
     category: str
     status: str
@@ -29,6 +42,7 @@ class CheckResult:
     severity: str = ""
     evidence_ids: tuple[str, ...] = ()
     remediation: str = ""
+    identities: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -38,6 +52,7 @@ class SecurityCheck:
     description: str
     execute: Callable[[Endpoint, HttpResponse | None, "CheckContext"], CheckResult]
     passive: bool = True
+    priority: int = 10
 
 
 @dataclass(slots=True)
@@ -78,7 +93,32 @@ def _is_success(response: HttpResponse | None) -> bool:
     return bool(response and response.status_code is not None and 200 <= response.status_code < 300)
 
 
-def _evidence(context: CheckContext, check_id: str, endpoint: str, observation: str, expected: str, actual: str, responses: list[HttpResponse | None], *, method: str = "UNKNOWN", identity: str | None = None, object_id: str | None = None, request_metadata_extra: dict[str, object] | None = None) -> Evidence:
+_AUTHORITATIVE_INVENTORY_HINTS = ("openapi", "swagger", "api-docs", "api_docs", "/docs", "docs/", "spec")
+
+
+def _is_authoritative_inventory_source(source: str) -> bool:
+    """Return True when an endpoint came from a supplied or discovered API inventory.
+
+    Endpoints parsed from a real OpenAPI/Swagger document (``file:`` uploads or
+    ``url:`` spec probes such as ``/swagger.json`` and ``/api-docs``) are authoritative
+    inventory and must not be reported as undocumented. Only direct target guesses or
+    documentation probes that are not parsed specifications warrant review.
+    """
+    value = (source or "").lower()
+    if value.startswith("file:"):
+        return True
+    if value.startswith("url:"):
+        return any(hint in value for hint in _AUTHORITATIVE_INVENTORY_HINTS)
+    return False
+
+
+def _evidence(context: CheckContext, check_id: str, endpoint: str, observation: str, expected: str, actual: str, responses: list[HttpResponse | None], *, method: str = "UNKNOWN", identity: str | None = None, object_id: str | None = None, request_metadata_extra: dict[str, object] | None = None, verified: bool = False) -> Evidence:
+    """Record an evidence artifact.
+
+    ``verified`` must only be True when the observed responses independently confirm
+    a vulnerability. Merely receiving an HTTP response is an *observation*, not proof,
+    so the default status is ``observed`` (or ``unavailable`` when no response arrived).
+    """
     response = next((item for item in reversed(responses) if item is not None), None)
     request_metadata: dict[str, object] = {"method": method, "url": endpoint}
     if identity:
@@ -86,6 +126,13 @@ def _evidence(context: CheckContext, check_id: str, endpoint: str, observation: 
     if object_id:
         request_metadata["object_id"] = object_id
     request_metadata.update(request_metadata_extra or {})
+    got_response = bool(response and response.status_code is not None)
+    if verified and got_response:
+        verification_status = "verified"
+    elif got_response:
+        verification_status = "observed"
+    else:
+        verification_status = "unavailable"
     return context.evidence.add(
         check_id=check_id,
         endpoint=endpoint,
@@ -94,7 +141,7 @@ def _evidence(context: CheckContext, check_id: str, endpoint: str, observation: 
         observation=observation,
         expected_behavior=expected,
         actual_behavior=actual,
-        verification_status="verified" if response and response.status_code is not None else "unavailable",
+        verification_status=verification_status,
     )
 
 
@@ -124,7 +171,7 @@ def check_inventory(endpoint: Endpoint, response: HttpResponse | None, context: 
         artifact = context.evidence.add(check_id="api9-improper-inventory", endpoint=endpoint.url, request_metadata=_request_meta(endpoint), response_metadata=_response_meta(response), observation="Endpoint is marked deprecated in the supplied API specification", expected_behavior="Deprecated API operations are retired or isolated from active inventory", actual_behavior="Deprecated operation remains discoverable", verification_status="observed")
         finding = Finding(title="Deprecated API operation remains exposed", category="API9", endpoint=endpoint.url, severity="low", confidence=0.9, status="candidate", description="The API inventory marks this operation deprecated while it remains exposed to the assessment.", impact="Deprecated operations can retain outdated controls and unexpected attack surface.", evidence_ids=[artifact.evidence_id], reproduction_summary=f"Discovered deprecated {endpoint.method} {endpoint.path}", remediation="Retire deprecated operations or document their remaining support and controls.", references=["OWASP API9"])
         return CheckResult("api9-improper-inventory", "API9", "FAIL", evidence=(artifact,), findings=(finding,), confidence=0.9, executed=True, endpoint=endpoint.url, method=endpoint.method)
-    if endpoint.source == "target" or endpoint.source.startswith("url:") and "openapi" not in endpoint.source:
+    if endpoint.source == "target" or (endpoint.source.startswith("url:") and not _is_authoritative_inventory_source(endpoint.source)):
         artifact = context.evidence.add(check_id="api9-improper-inventory", endpoint=endpoint.url, request_metadata=_request_meta(endpoint), response_metadata=_response_meta(response), observation="Endpoint was discovered without an authoritative supplied inventory", expected_behavior="API inventory is explicit and maintained", actual_behavior=f"Endpoint source: {endpoint.source}", verification_status="potential")
         finding = Finding(title="API endpoint inventory requires review", category="API9", endpoint=endpoint.url, severity="low", confidence=0.65, status="candidate", description="An API endpoint was assessed from a direct target or documentation probe rather than a supplied inventory.", impact="Undocumented or unmanaged endpoints can remain exposed.", evidence_ids=[artifact.evidence_id], reproduction_summary=f"Discovered {endpoint.method} {endpoint.url}", remediation="Maintain an authoritative API inventory and retire undocumented versions.", references=["OWASP API9"])
         return CheckResult("api9-improper-inventory", "API9", "FAIL", evidence=(artifact,), findings=(finding,), confidence=0.65, executed=True, endpoint=endpoint.url, method=endpoint.method)
@@ -143,7 +190,7 @@ def check_ssrf_indicator(endpoint: Endpoint, response: HttpResponse | None, cont
         case = configured[0]
         verification = context.client.request(endpoint.method, endpoint.url, params={case.parameter: case.verification_url})
         if case.callback_token in verification.body:
-            verified_artifact = _evidence(context, "api7-ssrf-verification", endpoint.url, "Controlled local callback token was returned by the configured fixture", "Only the explicitly configured local verification path is used", f"callback token observed: {case.callback_token}", [verification])
+            verified_artifact = _evidence(context, "api7-ssrf-verification", endpoint.url, "Controlled local callback token was returned by the configured fixture", "Only the explicitly configured local verification path is used", f"callback token observed: {case.callback_token}", [verification], verified=True)
             findings[0].status = "verified"
             findings[0].confidence = 0.98
             findings[0].evidence_ids.append(verified_artifact.evidence_id)
@@ -167,16 +214,17 @@ def check_property_authorization(endpoint: Endpoint, response: HttpResponse | No
     findings: list[Finding] = []
     leaked = [name for name in case.protected_properties if isinstance(payload, dict) and name in payload]
     if leaked:
-        artifact = _evidence(context, "api3-property-authorization", endpoint.url, f"Protected response properties exposed: {', '.join(leaked)}", "Protected properties are omitted or minimized for the configured identity", f"properties present: {', '.join(leaked)}", [configured_response], method=endpoint.method, identity=case.identity)
+        artifact = _evidence(context, "api3-property-authorization", endpoint.url, f"Protected response properties exposed: {', '.join(leaked)}", "Protected properties are omitted or minimized for the configured identity", f"properties present: {', '.join(leaked)}", [configured_response], method=endpoint.method, identity=case.identity, verified=True)
         evidence.append(artifact)
         findings.append(Finding(title="Excessive property exposure", category="API3", endpoint=endpoint.url, severity="medium", confidence=0.96, status="verified", description="The response contains properties explicitly designated as protected in the engagement configuration.", impact="Sensitive object properties may be disclosed to an unauthorized client.", evidence_ids=[artifact.evidence_id], reproduction_summary=f"GET {endpoint.url} as {case.identity}", remediation="Use response schemas and field-level authorization to omit protected properties.", references=["OWASP API3"]))
     if case.write_endpoint:
         write_url = _url(endpoint.url, case.write_endpoint)
         write_body = json.dumps({name: "__bugbounty_write_probe__" for name in case.protected_properties})
         write_response = context.client.request(case.write_method, write_url, identity=case.identity, body=write_body, headers={"Content-Type": "application/json"})
-        write_artifact = _evidence(context, "api3-property-write-authorization", write_url, "Attempted a bounded write of configured protected properties", "Protected properties cannot be modified by the configured identity", f"write status={write_response.status_code}", [write_response], method=case.write_method, identity=case.identity)
+        write_ok = _is_success(write_response)
+        write_artifact = _evidence(context, "api3-property-write-authorization", write_url, "Attempted a bounded write of configured protected properties", "Protected properties cannot be modified by the configured identity", f"write status={write_response.status_code}", [write_response], method=case.write_method, identity=case.identity, verified=write_ok)
         evidence.append(write_artifact)
-        if _is_success(write_response):
+        if write_ok:
             findings.append(Finding(title="Protected property write accepted", category="API3", endpoint=write_url, severity="medium", confidence=0.9, status="verified", description="A configured write endpoint accepted a bounded write containing protected properties.", impact="Clients may modify properties that should be protected by field-level authorization.", evidence_ids=[write_artifact.evidence_id], reproduction_summary=f"{case.write_method} {write_url} as {case.identity}", remediation="Reject unauthorized protected-property updates and enforce field-level write authorization.", references=["OWASP API3"]))
     if not findings:
         return CheckResult("api3-property-authorization", "API3", "PASS", evidence=tuple(evidence), executed=True, endpoint=endpoint.url, method=endpoint.method)
@@ -213,8 +261,9 @@ def check_business_flow(endpoint: Endpoint, response: HttpResponse | None, conte
         replay = next((step for step in flow.steps if step.name == flow.replay_step), None)
         if replay:
             replay_response = context.client.request(replay.method, _url(endpoint.url, replay.endpoint), identity=replay.identity)
-            artifact = _evidence(context, "api6-sensitive-business-flow", endpoint.url, f"Replayed configured flow step {flow.replay_step}", "Sensitive flow steps reject unauthorized or duplicate replay", f"replay status={replay_response.status_code}", [replay_response], method=replay.method, identity=replay.identity)
-            if _is_success(replay_response):
+            replay_ok = _is_success(replay_response)
+            artifact = _evidence(context, "api6-sensitive-business-flow", endpoint.url, f"Replayed configured flow step {flow.replay_step}", "Sensitive flow steps reject unauthorized or duplicate replay", f"replay status={replay_response.status_code}", [replay_response], method=replay.method, identity=replay.identity, verified=replay_ok)
+            if replay_ok:
                 finding = Finding(title="Sensitive business flow can be replayed", category="API6", endpoint=endpoint.url, severity="medium", confidence=0.9, status="verified", description="An explicitly configured flow step succeeded when replayed.", impact="Duplicate execution may cause repeated side effects in a sensitive workflow.", evidence_ids=[artifact.evidence_id], reproduction_summary=f"Replay flow {flow.name}, step {flow.replay_step}", remediation="Use idempotency keys, state transitions, and replay protection for sensitive actions.", references=["OWASP API6"])
                 return CheckResult("api6-sensitive-business-flow", "API6", "FAIL", evidence=(artifact,), findings=(finding,), confidence=0.9, executed=True, verified=True, endpoint=endpoint.url)
             return CheckResult("api6-sensitive-business-flow", "API6", "PASS", evidence=(artifact,), executed=True, endpoint=endpoint.url)
@@ -239,7 +288,7 @@ def check_authentication(endpoint: Endpoint, response: HttpResponse | None, cont
     evidence: list[Evidence] = []
     findings: list[Finding] = []
     if _is_success(response):
-        artifact = _evidence(context, "api2-broken-authentication", endpoint.url, "Protected endpoint returned success without an identity", "Authentication is required before protected data is returned", f"anonymous status={response.status_code}", [response], method=endpoint.method, identity="anonymous")
+        artifact = _evidence(context, "api2-broken-authentication", endpoint.url, "Protected endpoint returned success without an identity", "Authentication is required before protected data is returned", f"anonymous status={response.status_code}", [response], method=endpoint.method, identity="anonymous", verified=True)
         evidence.append(artifact)
         findings.append(Finding(title="Protected endpoint accessible anonymously", category="API2", endpoint=endpoint.url, severity="high", confidence=0.98, status="verified", description="An endpoint declared protected by the API specification returned a successful response without credentials.", impact="Unauthenticated callers may access protected API functionality or data.", evidence_ids=[artifact.evidence_id], reproduction_summary=f"GET {endpoint.url} without credentials", remediation="Enforce authentication at the API boundary and return an appropriate unauthorized response.", references=["OWASP API2"]))
     for identity in context.engagement.identities:
@@ -247,7 +296,7 @@ def check_authentication(endpoint: Endpoint, response: HttpResponse | None, cont
             continue
         invalid_response = context.client.request(endpoint.method, endpoint.url, identity=identity.name)
         if _is_success(invalid_response):
-            artifact = _evidence(context, "api2-broken-authentication", endpoint.url, f"Invalid credential identity {identity.name} was accepted", "Invalid, expired, or malformed credentials are rejected", f"{identity.name} status={invalid_response.status_code}", [invalid_response], method=endpoint.method, identity=identity.name)
+            artifact = _evidence(context, "api2-broken-authentication", endpoint.url, f"Invalid credential identity {identity.name} was accepted", "Invalid, expired, or malformed credentials are rejected", f"{identity.name} status={invalid_response.status_code}", [invalid_response], method=endpoint.method, identity=identity.name, verified=True)
             evidence.append(artifact)
             findings.append(Finding(title="Invalid authentication accepted", category="API2", endpoint=endpoint.url, severity="high", confidence=0.97, status="verified", description="An explicitly configured invalid credential identity received a successful response.", impact="Attackers may bypass authentication checks with invalid credentials.", evidence_ids=[artifact.evidence_id], reproduction_summary=f"GET {endpoint.url} as {identity.name}", remediation="Validate credential format, signature, expiry, issuer, and audience before authorizing requests.", references=["OWASP API2"]))
     if not evidence:
@@ -255,9 +304,10 @@ def check_authentication(endpoint: Endpoint, response: HttpResponse | None, cont
     return CheckResult("api2-broken-authentication", "API2", "FAIL", evidence=tuple(evidence), findings=tuple(findings), confidence=max(item.confidence for item in findings), executed=True, verified=True, endpoint=endpoint.url, method=endpoint.method)
 
 
-def check_authorization(endpoint: Endpoint, response: HttpResponse | None, context: CheckContext) -> CheckResult:
+def check_authorization_bola(endpoint: Endpoint, response: HttpResponse | None, context: CheckContext) -> CheckResult:
+    """Check for broken object-level authorization (OWASP API1)."""
     if len(context.engagement.identities) < 2:
-        return _not_run("api1-bola-api5-function", "API1/API5", "at least two explicitly supplied identities are required for differential authorization testing")
+        return _not_run("api1-bola", "API1", "at least two explicitly supplied identities are required for differential authorization testing")
     for case in context.engagement.object_authorization_cases:
         if case.endpoint not in endpoint.path and case.endpoint not in endpoint.url:
             continue
@@ -266,23 +316,38 @@ def check_authorization(endpoint: Endpoint, response: HttpResponse | None, conte
         owner_response = context.client.request(case.method, owner_url, identity=case.owner_identity)
         other_response = context.client.request(case.method, other_url, identity=case.other_identity)
         cross_response = context.client.request(case.method, owner_url, identity=case.other_identity)
-        artifact = _evidence(context, "api1-bola", owner_url, f"Compared owner identity {case.owner_identity} on object {case.owner_object_id} with other identity {case.other_identity} on object {case.other_object_id}, then requested the owner object cross-identity", "Owner succeeds on the owner object, the other identity succeeds on its own object, and the cross-identity request for the owner object is denied", f"owner={owner_response.status_code}, other_own_object={other_response.status_code}, cross_identity_owner_object={cross_response.status_code}", [owner_response, other_response, cross_response], method=case.method, identity=case.other_identity, object_id=case.owner_object_id, request_metadata_extra={"owner_identity": case.owner_identity, "other_identity": case.other_identity, "owner_object_id": case.owner_object_id, "other_object_id": case.other_object_id, "requested_object_id": case.owner_object_id})
-        if _is_success(owner_response) and _is_success(other_response) and _is_success(cross_response):
+        # BOLA is confirmed when the non-owner identity can access the owner's object.
+        # Requiring the owner baseline to also succeed caused false negatives when the
+        # baseline was denied but the cross-identity access still succeeded.
+        bola_confirmed = _is_success(cross_response) and case.owner_object_id != case.other_object_id
+        artifact = _evidence(context, "api1-bola", owner_url, f"Compared owner identity {case.owner_identity} on object {case.owner_object_id} with other identity {case.other_identity} on object {case.other_object_id}, then requested the owner object cross-identity", "Owner succeeds on the owner object, the other identity succeeds on its own object, and the cross-identity request for the owner object is denied", f"owner={owner_response.status_code}, other_own_object={other_response.status_code}, cross_identity_owner_object={cross_response.status_code}", [owner_response, other_response, cross_response], method=case.method, identity=case.other_identity, object_id=case.owner_object_id, request_metadata_extra={"owner_identity": case.owner_identity, "other_identity": case.other_identity, "owner_object_id": case.owner_object_id, "other_object_id": case.other_object_id, "requested_object_id": case.owner_object_id}, verified=bola_confirmed)
+        if bola_confirmed:
             finding = Finding(title="Broken object level authorization", category="API1", endpoint=owner_url, severity="high", confidence=0.99, status="verified", description="An explicitly configured non-owner identity accessed an object owned by another identity.", impact="Users may read or modify objects outside their authorization boundary.", evidence_ids=[artifact.evidence_id], reproduction_summary=f"{case.other_identity} requested object {case.owner_object_id}", remediation="Enforce object ownership or authorization checks on every object access.", references=["OWASP API1"])
             return CheckResult("api1-bola", "API1", "FAIL", evidence=(artifact,), findings=(finding,), confidence=0.99, executed=True, verified=True, endpoint=owner_url, method=case.method)
         return CheckResult("api1-bola", "API1", "PASS", evidence=(artifact,), executed=True, endpoint=owner_url, method=case.method)
+    return _not_run("api1-bola", "API1", "no explicit object authorization case matched this endpoint")
+
+
+def check_authorization_function(endpoint: Endpoint, response: HttpResponse | None, context: CheckContext) -> CheckResult:
+    """Check for broken function-level authorization (OWASP API5)."""
+    if len(context.engagement.identities) < 2:
+        return _not_run("api5-broken-function-level-authorization", "API5", "at least two explicitly supplied identities are required for differential authorization testing")
     for case in context.engagement.function_authorization_cases:
         if case.endpoint not in endpoint.path and case.endpoint not in endpoint.url:
             continue
         url = _url(endpoint.url, case.endpoint)
         allowed_response = context.client.request(case.method, url, identity=case.allowed_identity)
         denied_response = context.client.request(case.method, url, identity=case.denied_identity)
-        artifact = _evidence(context, "api5-function-authorization", url, f"Compared allowed role {case.allowed_identity} with denied role {case.denied_identity}", "Allowed role succeeds and denied role is rejected", f"allowed={allowed_response.status_code}, denied={denied_response.status_code}", [allowed_response, denied_response], method=case.method, identity=case.denied_identity)
-        if _is_success(allowed_response) and _is_success(denied_response):
+        # BFLA is confirmed when the lower-privilege identity is accepted by a function
+        # reserved for another role. Requiring the allowed baseline to succeed hid the
+        # vulnerability whenever that baseline was denied.
+        bfla_confirmed = _is_success(denied_response) and case.denied_identity != case.allowed_identity
+        artifact = _evidence(context, "api5-broken-function-level-authorization", url, f"Compared allowed role {case.allowed_identity} with denied role {case.denied_identity}", "Allowed role succeeds and denied role is rejected", f"allowed={allowed_response.status_code}, denied={denied_response.status_code}", [allowed_response, denied_response], method=case.method, identity=case.denied_identity, verified=bfla_confirmed)
+        if bfla_confirmed:
             finding = Finding(title="Broken function level authorization", category="API5", endpoint=url, severity="high", confidence=0.99, status="verified", description="An explicitly configured lower-privilege identity accessed a function reserved for another role.", impact="Users may invoke privileged operations without the required role.", evidence_ids=[artifact.evidence_id], reproduction_summary=f"{case.denied_identity} requested {url}", remediation="Enforce role or permission checks on the function endpoint.", references=["OWASP API5"])
-            return CheckResult("api5-function-authorization", "API5", "FAIL", evidence=(artifact,), findings=(finding,), confidence=0.99, executed=True, verified=True, endpoint=url, method=case.method)
-        return CheckResult("api5-function-authorization", "API5", "PASS", evidence=(artifact,), executed=True, endpoint=url, method=case.method)
-    return _not_run("api1-bola-api5-function", "API1/API5", "no explicit object or function authorization case matched this endpoint")
+            return CheckResult("api5-broken-function-level-authorization", "API5", "FAIL", evidence=(artifact,), findings=(finding,), confidence=0.99, executed=True, verified=True, endpoint=url, method=case.method)
+        return CheckResult("api5-broken-function-level-authorization", "API5", "PASS", evidence=(artifact,), executed=True, endpoint=url, method=case.method)
+    return _not_run("api5-broken-function-level-authorization", "API5", "no explicit function authorization case matched this endpoint")
 
 
 def check_unsupported(endpoint: Endpoint, response: HttpResponse | None, context: CheckContext, *, check_id: str, category: str, reason: str) -> CheckResult:
@@ -291,15 +356,16 @@ def check_unsupported(endpoint: Endpoint, response: HttpResponse | None, context
 
 def default_checks() -> list[SecurityCheck]:
     return [
-        SecurityCheck("api8-security-misconfiguration", "API8", "Passive security configuration review", check_security_misconfiguration),
-        SecurityCheck("api9-improper-inventory", "API9", "API inventory source review", check_inventory),
-        SecurityCheck("api7-ssrf-indicator", "API7", "Safe SSRF sink identification", check_ssrf_indicator),
-        SecurityCheck("api2-broken-authentication", "API2", "Authentication prerequisite assessment", check_authentication),
-        SecurityCheck("api1-bola-api5-function", "API1/API5", "Differential authorization prerequisite assessment", check_authorization),
-        SecurityCheck("api3-property-authorization", "API3", "Property-level authorization assessment", check_property_authorization),
-        SecurityCheck("api4-resource-consumption", "API4", "Conservative resource consumption assessment", check_resource_consumption),
-        SecurityCheck("api6-sensitive-business-flow", "API6", "Sensitive business flow assessment", check_business_flow),
-        SecurityCheck("api10-unsafe-consumption", "API10", "Unsafe consumption assessment", check_unsafe_consumption),
+        SecurityCheck("api1-bola", "API1", "Broken object-level authorization assessment", check_authorization_bola, priority=1),
+        SecurityCheck("api5-broken-function-level-authorization", "API5", "Broken function-level authorization assessment", check_authorization_function, priority=2),
+        SecurityCheck("api2-broken-authentication", "API2", "Authentication prerequisite assessment", check_authentication, priority=3),
+        SecurityCheck("api3-property-authorization", "API3", "Property-level authorization assessment", check_property_authorization, priority=4),
+        SecurityCheck("api7-ssrf-indicator", "API7", "Safe SSRF sink identification", check_ssrf_indicator, priority=5),
+        SecurityCheck("api8-security-misconfiguration", "API8", "Passive security configuration review", check_security_misconfiguration, priority=6),
+        SecurityCheck("api9-improper-inventory", "API9", "API inventory source review", check_inventory, priority=7),
+        SecurityCheck("api10-unsafe-consumption", "API10", "Unsafe consumption assessment", check_unsafe_consumption, priority=8),
+        SecurityCheck("api4-resource-consumption", "API4", "Conservative resource consumption assessment", check_resource_consumption, priority=9),
+        SecurityCheck("api6-sensitive-business-flow", "API6", "Sensitive business flow assessment", check_business_flow, priority=10),
     ]
 
 
