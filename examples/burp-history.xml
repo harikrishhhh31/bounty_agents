@@ -1,0 +1,30 @@
+<items>
+  <item>
+    <time>2026-09-15T10:00:00Z</time>
+    <host>api.example.com</host>
+    <port>443</port>
+    <protocol>https</protocol>
+    <request>GET /users?filter=active HTTP/1.1
+Host: api.example.com
+
+</request>
+    <response>HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"id":1}</response>
+  </item>
+  <item>
+    <time>2026-09-15T10:01:00Z</time>
+    <host>outside.example</host>
+    <port>443</port>
+    <protocol>https</protocol>
+    <request>GET /admin HTTP/1.1
+Host: outside.example
+
+</request>
+    <response>HTTP/1.1 200 OK
+Content-Type: application/json
+
+{}</response>
+  </item>
+</items>

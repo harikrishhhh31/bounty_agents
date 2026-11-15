@@ -1,0 +1,24 @@
+# Copy and edit for an explicitly authorized API assessment.
+target_url: http://127.0.0.1:8000
+allowed_hosts:
+  - 127.0.0.1
+allowed_schemes:
+  - http
+allowed_methods:
+  - GET
+request_rate_limit: 5
+timeout: 5
+maximum_requests: 50
+dry_run: true
+workspace: ./assessment-output
+identities: []
+object_authorization_cases: []
+function_authorization_cases: []
+property_authorization_cases: []
+resource_probes: []
+business_flows: []
+ssrf_cases: []
+discovery:
+  documentation_paths:
+    - /openapi.json
+    - /swagger.json
